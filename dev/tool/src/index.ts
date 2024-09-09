@@ -33,7 +33,8 @@ import accountPlugin, {
   setRole,
   updateWorkspace,
   createWorkspace as createWorkspaceRecord,
-  type Workspace
+  type Workspace,
+  type LoginInfo
 } from '@hcengineering/account'
 import { createWorkspace, upgradeWorkspace } from '@hcengineering/workspace-service'
 import { setMetadata } from '@hcengineering/platform'
@@ -210,13 +211,16 @@ export function devTool (
   program
     .command('import-notion <dir>')
     .description('import extracted archive exported from Notion as "Markdown & CSV"')
+    .requiredOption('-u, --user <user>', 'user')
+    .requiredOption('-pw, --password <password>', 'password')
     .requiredOption('-ws, --workspace <workspace>', 'workspace where the documents should be imported to')
     .action(async (dir: string, cmd) => {
-      if (cmd.workspace === '') return
+      if (cmd.workspace === '' || cmd.user === '' || cmd.password === '') return
 
-      const { mongodbUri } = prepareTools()
+      const loginInfo = await login(accountsUrl, cmd.user, cmd.password)
+      const tools = prepareTools()
 
-      await withDatabase(mongodbUri, async (db) => {
+      await withDatabase(tools.mongodbUri, async (db) => {
         const ws = await getWorkspaceById(db, cmd.workspace)
         if (ws === null) {
           console.log('Workspace not found: ', cmd.workspace)
@@ -229,7 +233,7 @@ export function devTool (
           workspaceUrl: ws.workspaceUrl ?? ''
         }
 
-        await withStorage(mongodbUri, async (storageAdapter) => {
+        await withStorage(tools.mongodbUri, async (storageAdapter) => {
           const token = generateToken(systemAccountEmail, { name: ws.workspace })
           const endpoint = await getTransactorEndpoint(token, 'external')
           const connection = (await connect(endpoint, wsUrl, undefined, {
@@ -1489,4 +1493,20 @@ export function devTool (
   extendProgram?.(program)
 
   program.parse(process.argv)
+}
+
+async function login (accountsUrl: string, user: string, password: string): Promise<LoginInfo> {
+  const response = await fetch(accountsUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      method: 'login',
+      params: [user, password]
+    })
+  })
+
+  const body = await response.json()
+  return body.result as LoginInfo
 }
