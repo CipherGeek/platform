@@ -6,9 +6,10 @@ import {
   makeCollaborativeDoc,
   type MeasureMetricsContext,
   type TxOperations,
-  type Blob
+  type Blob,
+  collaborativeDocParse
 } from '@hcengineering/core'
-import { saveCollaborativeDoc } from '@hcengineering/collaboration'
+import { saveCollaborativeDoc, yDocToBuffer } from '@hcengineering/collaboration'
 import document, { type Document, type Teamspace } from '@hcengineering/document'
 import { type StorageAdapter } from '@hcengineering/server-core'
 import {
@@ -509,8 +510,27 @@ async function importPageDocument (
 
   // await yDocToStorage(ctx, storageAdapter, workspace, documentId, ydoc)
 
-  // const buffer = yDocToBuffer(ydoc)
+  const { documentId } = collaborativeDocParse(collabId)
+  const buffer = yDocToBuffer(yDoc)
   // await storageAdapter.put(ctx, workspace, documentId, buffer, 'application/ydoc', buffer.length)
+
+  // await storage.put(ctx, ws, docMeta.id, data, type, size)
+
+  const form = new FormData()
+  const file = new File([new Blob([buffer])], docMeta.name)
+  // const file = new File([data], docMeta.name)
+  form.append('file', file, documentId)
+  form.append('type', 'application/ydoc')
+  form.append('size', buffer.length.toString())
+  form.append('name', docMeta.name)
+  form.append('id', docMeta.id)
+  form.append('data', new Blob([buffer])) // ?
+
+  const response = await uploadFile(docMeta.id, form)
+
+  console.log(response)
+  console.log(response.result)
+  console.log(response.result)
 
   const parentId = parentMeta?.id ?? document.ids.NoParent
 
