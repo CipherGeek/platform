@@ -34,7 +34,9 @@ import accountPlugin, {
   updateWorkspace,
   createWorkspace as createWorkspaceRecord,
   type Workspace,
-  type LoginInfo
+  type LoginInfo,
+  type ClientWorkspaceInfo,
+  type WorkspaceLoginInfo
 } from '@hcengineering/account'
 import { createWorkspace, upgradeWorkspace } from '@hcengineering/workspace-service'
 import { setMetadata } from '@hcengineering/platform'
@@ -47,7 +49,7 @@ import {
   createStorageBackupStorage,
   restore
 } from '@hcengineering/server-backup'
-import serverClientPlugin, { BlobClient, createClient, getTransactorEndpoint } from '@hcengineering/server-client'
+import serverClientPlugin, { BlobClient, createClient, getTransactorEndpoint, getWorkspaceInfo } from '@hcengineering/server-client'
 import serverToken, { decodeToken, generateToken } from '@hcengineering/server-token'
 import toolPlugin, { connect, FileModelLogger } from '@hcengineering/server-tool'
 import path from 'path'
@@ -73,7 +75,9 @@ import core, {
   type Ref,
   type Tx,
   type Version,
-  type WorkspaceId
+  type WorkspaceId,
+  type BaseWorkspaceInfo,
+  concatLink
 } from '@hcengineering/core'
 import { consoleModelLogger, type MigrateOperation } from '@hcengineering/model'
 import contact from '@hcengineering/model-contact'
@@ -153,6 +157,15 @@ export function devTool (
     return elasticUrl
   }
 
+  function getFrontUrl (): string {
+    const frontUrl = process.env.FRONT_URL
+    if (frontUrl === undefined) {
+      console.error('please provide front url')
+      process.exit(1)
+    }
+    return frontUrl
+  }
+
   const initWS = process.env.INIT_WORKSPACE
   if (initWS !== undefined) {
     setMetadata(toolPlugin.metadata.InitWorkspace, initWS)
@@ -215,37 +228,54 @@ export function devTool (
     .requiredOption('-pw, --password <password>', 'password')
     .requiredOption('-ws, --workspace <workspace>', 'workspace where the documents should be imported to')
     .action(async (dir: string, cmd) => {
-      if (cmd.workspace === '' || cmd.user === '' || cmd.password === '') return
+      if (transactorUrl === undefined) {
+        console.error('please provide transactor url.')
+        return
+      }
+      if (cmd.workspace === '' || cmd.user === '' || cmd.password === '') {
+        return
+      }
 
-      const loginInfo = await login(accountsUrl, cmd.user, cmd.password)
-      const tools = prepareTools()
+      const loginInfo = await login(accountsUrl, cmd.user, cmd.password, cmd.workspace)
+      const allWorkspaces = (await getUserWorkspacesApi(accountsUrl, loginInfo.token))
+      const workspaces = allWorkspaces.filter(ws => ws.workspaceId === cmd.workspace)
+      if (workspaces.length < 1) {
+        console.log('Workspace not found: ', cmd.workspace)
+        return
+      }
 
-      await withDatabase(tools.mongodbUri, async (db) => {
-        const ws = await getWorkspaceById(db, cmd.workspace)
-        if (ws === null) {
-          console.log('Workspace not found: ', cmd.workspace)
-          return
+      const selectedWs = await selectWorkspaceApi(accountsUrl, loginInfo.token, workspaces[0].workspace)
+      console.log(selectedWs)
+
+      function uploader (token: string) {
+        return (id: string, data: any) => {
+          // const body = new FormData()
+          // body.append('file', data, id)
+          // body.append('file', new Blob([data]), id)
+          return fetch(concatLink(getFrontUrl(), '/files'), {
+            method: 'POST',
+            headers: {
+              Authorization: 'Bearer ' + token
+            },
+            body: data
+          })
         }
+      }
 
-        const wsUrl: WorkspaceIdWithUrl = {
-          name: ws.workspace,
-          workspaceName: ws.workspaceName ?? '',
-          workspaceUrl: ws.workspaceUrl ?? ''
-        }
+      const ws: WorkspaceId = {
+        name: workspaces[0].workspaceId
+      }
 
-        await withStorage(tools.mongodbUri, async (storageAdapter) => {
-          const token = generateToken(systemAccountEmail, { name: ws.workspace })
-          const endpoint = await getTransactorEndpoint(token, 'external')
-          const connection = (await connect(endpoint, wsUrl, undefined, {
-            mode: 'backup'
-          })) as unknown as CoreClient
-          const client = new TxOperations(connection, core.account.System)
-
-          await importNotion(toolCtx, client, storageAdapter, dir, wsUrl)
-
-          await connection.close()
-        })
-      })
+      // await withDatabase(tools.mongodbUri, async (db) => {
+      //   await withStorage(tools.mongodbUri, async (storageAdapter) => {
+      const connection = (await connect(selectedWs.endpoint, ws, undefined, {
+        mode: 'backup'
+      })) as unknown as CoreClient
+      const client = new TxOperations(connection, core.account.System)
+      await importToTeamspace(toolCtx, client, undefined, uploader(selectedWs.token), dir, ws, 'kuku')
+      await connection.close()
+      //   })
+      // })
     })
 
   // import-notion-to-teamspace /home/anna/work/notion/pages/exported --workspace workspace --teamspace notion
@@ -281,7 +311,7 @@ export function devTool (
           })) as unknown as CoreClient
           const client = new TxOperations(connection, core.account.System)
 
-          await importToTeamspace(toolCtx, client, storageAdapter, dir, wsUrl, cmd.teamspace)
+          // await importToTeamspace(toolCtx, client, storageAdapter, dir, wsUrl, cmd.teamspace)
 
           await connection.close()
         })
@@ -1495,7 +1525,7 @@ export function devTool (
   program.parse(process.argv)
 }
 
-async function login (accountsUrl: string, user: string, password: string): Promise<LoginInfo> {
+async function login (accountsUrl: string, user: string, password: string, workspace: string): Promise<LoginInfo> {
   const response = await fetch(accountsUrl, {
     method: 'POST',
     headers: {
@@ -1503,10 +1533,57 @@ async function login (accountsUrl: string, user: string, password: string): Prom
     },
     body: JSON.stringify({
       method: 'login',
-      params: [user, password]
+      params: [user, password, workspace]
     })
   })
 
   const body = await response.json()
-  return body.result as LoginInfo
+  return body.result as LoginInfo // || undefined
+}
+
+async function listWorkspaces (accountsUrl: string, token: string): Promise<BaseWorkspaceInfo[]> {
+  const response = await fetch(accountsUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      method: 'listWorkspaces',
+      params: [token]
+    })
+  })
+  const body = await response.json()
+  return (body.result as BaseWorkspaceInfo[]) ?? []
+}
+
+async function getUserWorkspacesApi (accountsUrl: string, token: string): Promise<ClientWorkspaceInfo[]> {
+  const response = await fetch(accountsUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + token,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      method: 'getUserWorkspaces',
+      params: []
+    })
+  })
+  const body = await response.json()
+  return (body.result as ClientWorkspaceInfo[]) ?? []
+}
+
+async function selectWorkspaceApi (accountsUrl: string, token: string, workspace: string): Promise<WorkspaceLoginInfo> {
+  const response = await fetch(accountsUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + token
+    },
+    body: JSON.stringify({
+      method: 'selectWorkspace',
+      params: [workspace, 'external']
+    })
+  })
+  const body = await response.json()
+  return body.result as WorkspaceLoginInfo
 }
